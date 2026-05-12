@@ -3,8 +3,8 @@
 Covers:
   - _aux_title_configured() broad detection (provider, model, base_url)
   - generate_title_raw_via_aux() reads timeout from config instead of hardcoding 15.0
-  - aux→agent fallback triggers on 'llm_invalid_aux' status (Comment 1)
-  - _aux_title_timeout rejects zero, negative, and non-numeric values (Comment 4)
+  - aux→agent fallback triggers on 'llm_invalid_aux' status
+  - _aux_title_timeout rejects zero, negative, and non-numeric values
 """
 import sys
 import types
@@ -72,9 +72,14 @@ class TestGenerateTitleRawViaAuxTimeout(unittest.TestCase):
     def _run_with_config(self, tg_config, expected_timeout):
         from api.streaming import generate_title_raw_via_aux
 
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = 'Test Title'
+        mock_resp = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content='Test Title'),
+                    finish_reason='stop',
+                )
+            ]
+        )
 
         captured = {}
 
@@ -118,8 +123,263 @@ class TestGenerateTitleRawViaAuxTimeout(unittest.TestCase):
         )
 
 
+class TestReasoningModelTitleGeneration(unittest.TestCase):
+    """Regression coverage for reasoning models that spend output budget on reasoning."""
+
+    def test_title_budget_defaults_to_reasoning_safe_value(self):
+        """Title generation should not use a tiny output cap that starves final content."""
+        from api.streaming import _title_completion_budget, _title_retry_completion_budget
+
+        self.assertEqual(_title_completion_budget(), 512)
+        self.assertEqual(_title_retry_completion_budget(), 1024)
+
+    def test_aux_short_circuits_on_empty_reasoning_without_retrying(self):
+        """Regression for #2083: reasoning models that emit only hidden
+        reasoning tokens (no visible content) must NOT trigger a budget-doubling
+        retry — the second call invariably produces the same empty-reasoning
+        shape and just doubles the GPU/credit burn.  Short-circuit to the local
+        fallback path instead."""
+        from api.streaming import generate_title_raw_via_aux
+
+        call_count = [0]
+
+        def fake_call_llm(**kwargs):
+            call_count[0] += 1
+            return {
+                'choices': [
+                    {
+                        'message': {'content': '', 'reasoning': 'long hidden reasoning'},
+                        'finish_reason': 'length',
+                    }
+                ]
+            }
+
+        with _patch_tg_config({'provider': 'ollama', 'model': 'kimi-k2.6', 'base_url': 'https://ollama.com/v1'}):
+            with patch('agent.auxiliary_client.call_llm', side_effect=fake_call_llm, create=True):
+                result, status = generate_title_raw_via_aux(
+                    user_text='Hey nur ein kurzer Test',
+                    assistant_text='Alles klar, ich helfe dir dabei.',
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(status, 'llm_empty_reasoning_aux')
+        # One call per prompt at the base budget — no retry on prompt 0, no
+        # second-prompt attempt either (short-circuited).
+        self.assertEqual(call_count[0], 1)
+
+    def test_aux_still_retries_finish_length_without_reasoning(self):
+        """Length-truncated responses WITHOUT reasoning tokens still get the
+        budget-doubling retry — those are legitimately recoverable by giving
+        the model more headroom."""
+        from api.streaming import generate_title_raw_via_aux
+
+        responses = [
+            {'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}]},
+            {'choices': [{'message': {'content': 'Useful Session Title'}, 'finish_reason': 'stop'}]},
+        ]
+        captured_budgets = []
+
+        def fake_call_llm(**kwargs):
+            captured_budgets.append(kwargs.get('max_tokens'))
+            return responses.pop(0)
+
+        with _patch_tg_config({'provider': 'ollama', 'model': 'kimi-k2.6', 'base_url': 'https://ollama.com/v1'}):
+            with patch('agent.auxiliary_client.call_llm', side_effect=fake_call_llm, create=True):
+                result, status = generate_title_raw_via_aux(
+                    user_text='Hey nur ein kurzer Test',
+                    assistant_text='Alles klar, ich helfe dir dabei.',
+                )
+
+        self.assertEqual(result, 'Useful Session Title')
+        self.assertEqual(status, 'llm_aux_retry')
+        self.assertEqual(captured_budgets, [512, 1024])
+
+    def test_aux_returns_specific_status_when_reasoning_retry_still_empty(self):
+        """Diagnostics should expose the provider failure mode instead of generic llm_error_aux."""
+        from api.streaming import generate_title_raw_via_aux
+
+        def empty_length_response(**kwargs):
+            return {
+                'choices': [
+                    {
+                        'message': {'content': '', 'reasoning': 'still reasoning'},
+                        'finish_reason': 'length',
+                    }
+                ]
+            }
+
+        with _patch_tg_config({'provider': 'ollama', 'model': 'kimi-k2.6', 'base_url': 'https://ollama.com/v1'}):
+            with patch('agent.auxiliary_client.call_llm', side_effect=empty_length_response, create=True):
+                result, status = generate_title_raw_via_aux(
+                    user_text='Hey nur ein kurzer Test',
+                    assistant_text='Alles klar, ich helfe dir dabei.',
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(status, 'llm_empty_reasoning_aux')
+
+    def test_agent_route_short_circuits_on_empty_reasoning_without_retrying(self):
+        """Regression for #2083 on the active-agent route: empty-reasoning
+        responses must NOT trigger a budget-doubling retry."""
+        from api.streaming import generate_title_raw_via_agent
+
+        call_count = [0]
+
+        def fake_create(**kwargs):
+            call_count[0] += 1
+            return {
+                'choices': [
+                    {
+                        'message': {'content': '', 'reasoning': 'long hidden reasoning'},
+                        'finish_reason': 'length',
+                    }
+                ]
+            }
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=fake_create)
+            )
+        )
+        agent = MagicMock()
+        agent.api_mode = 'openai'
+        agent.provider = 'ollama'
+        agent.model = 'kimi-k2.6'
+        agent.base_url = 'https://ollama.com/v1'
+        agent.reasoning_config = None
+        agent._build_api_kwargs.return_value = {}
+        agent._ensure_primary_openai_client.return_value = client
+
+        result, status = generate_title_raw_via_agent(
+            agent,
+            user_text='Hey nur ein kurzer Test',
+            assistant_text='Alles klar, ich helfe dir dabei.',
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(status, 'llm_empty_reasoning')
+        # One call per prompt at base budget — no retry, no second-prompt attempt.
+        self.assertEqual(call_count[0], 1)
+        self.assertIsNone(agent.reasoning_config)
+
+    def test_agent_route_still_retries_finish_length_without_reasoning(self):
+        """The active-agent route should preserve retry-on-length-no-reasoning."""
+        from api.streaming import generate_title_raw_via_agent
+
+        responses = [
+            {'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}]},
+            {'choices': [{'message': {'content': 'Agent Session Title'}, 'finish_reason': 'stop'}]},
+        ]
+        captured_budgets = []
+
+        def fake_create(**kwargs):
+            captured_budgets.append(kwargs.get('max_tokens') or kwargs.get('max_completion_tokens'))
+            return responses.pop(0)
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=fake_create)
+            )
+        )
+        agent = MagicMock()
+        agent.api_mode = 'openai'
+        agent.provider = 'ollama'
+        agent.model = 'kimi-k2.6'
+        agent.base_url = 'https://ollama.com/v1'
+        agent.reasoning_config = None
+        agent._build_api_kwargs.return_value = {}
+        agent._ensure_primary_openai_client.return_value = client
+
+        result, status = generate_title_raw_via_agent(
+            agent,
+            user_text='Hey nur ein kurzer Test',
+            assistant_text='Alles klar, ich helfe dir dabei.',
+        )
+
+        self.assertEqual(result, 'Agent Session Title')
+        self.assertEqual(status, 'llm_retry')
+        self.assertEqual(captured_budgets, [512, 1024])
+        self.assertIsNone(agent.reasoning_config)
+
+    @patch('api.streaming._aux_title_configured', return_value=True)
+    @patch('api.streaming._generate_llm_session_title_via_aux')
+    @patch('api.streaming.get_session')
+    def test_fallback_title_status_keeps_underlying_llm_reason(
+        self, mock_get_session, mock_aux_title, mock_configured,
+    ):
+        """Local fallback should not hide that the LLM failed because it hit length."""
+        from api.streaming import _run_background_title_update
+
+        mock_session = MagicMock()
+        mock_session.title = 'Untitled'
+        mock_session.llm_title_generated = False
+        mock_session.messages = [
+            {'role': 'user', 'content': 'Hey nur ein kurzer Test'},
+            {'role': 'assistant', 'content': 'Alles klar, ich helfe dir dabei.'},
+        ]
+        mock_get_session.return_value = mock_session
+        mock_aux_title.return_value = (None, 'llm_length_aux', '')
+        events = []
+
+        _run_background_title_update(
+            session_id='reasoning-title-session',
+            user_text='Hey nur ein kurzer Test',
+            assistant_text='Alles klar, ich helfe dir dabei.',
+            placeholder_title='Untitled',
+            put_event=lambda event_type, data: events.append((event_type, data)),
+            agent=None,
+        )
+
+        title_status = [data for event_type, data in events if event_type == 'title_status']
+        self.assertTrue(title_status)
+        self.assertEqual(title_status[0]['status'], 'fallback')
+        self.assertEqual(title_status[0]['reason'], 'local_summary:llm_length_aux')
+
+    @patch('api.streaming._aux_title_configured', return_value=True)
+    @patch('api.streaming._generate_llm_session_title_via_aux')
+    @patch('api.streaming.get_session')
+    def test_generic_fallback_title_is_not_persisted(
+        self, mock_get_session, mock_aux_title, mock_configured,
+    ):
+        """A generic local fallback is worse than the provisional first-message title."""
+        from api.streaming import _run_background_title_update
+
+        provisional_title = '\u5e2e\u6211\u53bb\u627e\u4e00\u672c\u300a\u7ea2\u697c\u68a6\u300b\u7535\u5b50\u4e66'
+        first_user_text = provisional_title + '\u3002'
+        mock_session = MagicMock()
+        mock_session.title = provisional_title
+        mock_session.llm_title_generated = False
+        mock_session.messages = [
+            {'role': 'user', 'content': first_user_text},
+            {'role': 'assistant', 'content': ''},
+        ]
+        mock_get_session.return_value = mock_session
+        mock_aux_title.return_value = (None, 'llm_error_aux', '')
+        events = []
+
+        _run_background_title_update(
+            session_id='generic-title-session',
+            user_text=first_user_text,
+            assistant_text='',
+            placeholder_title=provisional_title,
+            put_event=lambda event_type, data: events.append((event_type, data)),
+            agent=None,
+        )
+
+        title_events = [data for event_type, data in events if event_type == 'title']
+        title_status = [data for event_type, data in events if event_type == 'title_status']
+        self.assertEqual(title_events, [])
+        self.assertTrue(title_status)
+        self.assertEqual(title_status[0]['status'], 'skipped')
+        self.assertEqual(title_status[0]['reason'], 'llm_error_aux')
+        self.assertEqual(title_status[0]['title'], provisional_title)
+        self.assertEqual(mock_session.title, provisional_title)
+        self.assertFalse(mock_session.llm_title_generated)
+        mock_session.save.assert_not_called()
+
+
 class TestAuxTitleTimeoutEdgeCases(unittest.TestCase):
-    """Comment 4: _aux_title_timeout must reject zero, negative, and non-numeric values."""
+    """_aux_title_timeout must reject zero, negative, and non-numeric values."""
 
     def _call(self, tg_config, default=15.0):
         from api.streaming import _aux_title_timeout
@@ -158,7 +418,7 @@ class TestAuxTitleTimeoutEdgeCases(unittest.TestCase):
 
 
 class TestAuxInvalidAuxTriggersAgentFallback(unittest.TestCase):
-    """Comment 1: when aux returns llm_invalid_aux, the agent route must be tried as fallback.
+    """When aux returns llm_invalid_aux, the agent route must be tried as fallback.
 
     Pins the behaviour so the fallback tuple in _run_background_title_update
     stays synchronised with the statuses that _generate_llm_session_title_via_aux
